@@ -146,8 +146,10 @@ Panel {
             root.callHost("pinEntry", root.selectedEntry.id, !root.selectedEntry.pinned)
         } else if (t === "c" || t === "C") {
           root.activateSelected()
+        } else if (t === "r" || t === "R") {
+          if (root.selectedEntry)
+            root.callHost("retranscribeEntry", root.selectedEntry.id)
         }
-      }
 
       Column {
         id: content
@@ -421,6 +423,13 @@ Panel {
               }
 
               PanelActionButton {
+                iconText: String.fromCodePoint(0xF0450)
+                tooltipText: "Re-transcribe"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                onClicked: root.callHost("retranscribeEntry", modelData.id)
+              }
+              PanelActionButton {
                 iconText: String.fromCodePoint(0xF01B4)
                 tooltipText: "Delete"
                 foreground: root.urgent
@@ -440,7 +449,7 @@ Panel {
           Text {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
-            text: "c copies · p pins · / searches"
+            text: "c copies · p pins · r re-transcribes · / searches"
             color: root.dim
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.caption

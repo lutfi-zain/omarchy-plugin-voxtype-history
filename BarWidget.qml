@@ -72,6 +72,7 @@ BarWidget {
   function copyEntry(id) { runCli(["copy", id]) }
   function pinEntry(id, pinned) { runCli([pinned ? "pin" : "unpin", id]) }
   function deleteEntry(id) { runCli(["delete", id]) }
+  function retranscribeEntry(id) { runCli(["retranscribe", id]) }
   function clearUnpinned() { runCli(["clear"]) }
   function clearAll() { runCli(["clear", "--all"]) }
 

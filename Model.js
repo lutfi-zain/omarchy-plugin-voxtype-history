@@ -8,7 +8,8 @@ function normalizeEntry(value) {
     id: id,
     ts: String(value.ts || ""),
     text: text,
-    pinned: value.pinned === true
+    pinned: value.pinned === true,
+    audio: value.audio ? String(value.audio) : ""
   }
 }
 

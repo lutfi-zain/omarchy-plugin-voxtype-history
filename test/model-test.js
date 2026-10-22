@@ -20,17 +20,18 @@ function assert(condition, message) {
   if (!condition) throw new Error(message)
 }
 
-const now = new Date("2026-08-25T21:00:00Z")
+const now = new Date("2026-08-25T14:00:00Z")
 const raw = [
-  JSON.stringify({ id: "aaa", ts: "2026-08-25T10:00:00Z", text: "hello world", pinned: false }),
+  JSON.stringify({ id: "aaa", ts: "2026-08-25T10:00:00Z", text: "hello world", pinned: false, audio: "/tmp/aaa.wav" }),
   JSON.stringify({ id: "bbb", ts: "2026-08-24T10:00:00Z", text: "older note", pinned: true }),
-  JSON.stringify({ id: "ccc", ts: "2026-08-25T20:00:00Z", text: "latest dictation", pinned: false }),
+  JSON.stringify({ id: "ccc", ts: "2026-08-25T12:00:00Z", text: "latest dictation", pinned: false }),
   "not json",
   JSON.stringify({ id: "skip", ts: "2026-08-25T20:00:00Z", text: "   " })
 ].join("\n")
 
 const entries = M.parseHistory(raw)
 assertEqual(entries.length, 3, "skips invalid and empty lines")
+assertEqual(entries[0].audio, "/tmp/aaa.wav", "preserves audio path")
 assertEqual(M.todayCount(entries, now), 2, "counts local-day entries")
 
 const sorted = M.sortedEntries(entries)

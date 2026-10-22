@@ -48,6 +48,15 @@ def data_dir() -> Path:
     return Path(root) / PLUGIN_NAME
 
 
+def audio_dir() -> Path:
+    return data_dir() / "audio"
+
+
+def active_rec_path() -> Path:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or str(data_dir())
+    return Path(runtime) / f"{PLUGIN_NAME}-active.json"
+
+
 def voxtype_config_path() -> Path:
     root = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(root) / "voxtype" / "config.toml"
@@ -83,6 +92,15 @@ def ensure_dirs() -> None:
         os.fchmod(fd, 0o700)
     finally:
         os.close(fd)
+
+    aud = audio_dir()
+    refuse_symlink(aud)
+    aud.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd2 = os.open(aud, flags)
+    try:
+        os.fchmod(fd2, 0o700)
+    finally:
+        os.close(fd2)
 
 
 class StoreLock:
@@ -259,6 +277,21 @@ def save_meta(meta: dict) -> None:
     write_text_atomic(meta_path(), json.dumps(meta, indent=2) + "\n")
 
 
+def delete_audio_for_entry(entry: dict) -> None:
+    audio = entry.get("audio")
+    if audio:
+        try:
+            Path(audio).unlink(missing_ok=True)
+        except OSError:
+            pass
+    ident = entry.get("id")
+    if ident:
+        try:
+            (audio_dir() / f"{ident}.wav").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def normalize_entry(raw) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -266,12 +299,16 @@ def normalize_entry(raw) -> dict | None:
     ident = str(raw.get("id") or "")
     if not ident or not text.strip():
         return None
-    return {
+    entry = {
         "id": ident,
         "ts": str(raw.get("ts") or ""),
         "text": text,
         "pinned": bool(raw.get("pinned")),
     }
+    audio = raw.get("audio")
+    if audio and isinstance(audio, str):
+        entry["audio"] = audio
+    return entry
 
 
 def load_entries() -> list[dict]:
@@ -308,17 +345,23 @@ def prune_entries(entries: list[dict], max_entries: int) -> list[dict]:
     unpinned = [entry for entry in entries if not entry.get("pinned")]
     overflow = max(0, len(unpinned) - max_entries)
     if overflow:
+        dropped = unpinned[:overflow]
+        for item in dropped:
+            delete_audio_for_entry(item)
         unpinned = unpinned[overflow:]
     return pinned + unpinned
 
 
-def new_entry(text: str) -> dict:
-    return {
-        "id": uuid.uuid4().hex[:12],
+def new_entry(text: str, ident: str | None = None, audio_path: str | None = None) -> dict:
+    item = {
+        "id": ident or uuid.uuid4().hex[:12],
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "text": clip_transcript(text),
         "pinned": False,
     }
+    if audio_path:
+        item["audio"] = audio_path
+    return item
 
 
 def find_entry(entries: list[dict], ident: str) -> dict | None:
@@ -446,7 +489,6 @@ def enable_in_config(config_path: Path, hook: str, timeout_ms: int) -> dict:
         f'command = "{toml_quote(hook)}"\n'
         f"timeout_ms = {effective_timeout}\n"
     )
-
     if section:
         start, end = section.span()
         updated = original[:start] + block + original[end:].lstrip("\n")
@@ -457,6 +499,22 @@ def enable_in_config(config_path: Path, hook: str, timeout_ms: int) -> dict:
         if not updated.endswith("\n"):
             updated += "\n"
 
+    hook_bin = hook[:-4] if hook.endswith(" log") else hook
+    rec_start_cmd = f"{hook_bin} record-start"
+    rec_stop_cmd = f"{hook_bin} record-stop"
+    updated = re.sub(
+        r'(?m)^\s*(pre_recording_command|post_output_command)\s*=.*?' + re.escape(PLUGIN_NAME) + r'.*?\n',
+        '',
+        updated,
+    )
+    out_section = re.search(r"(?m)^\[output\]\s*$", updated)
+    if out_section:
+        pos = out_section.end()
+        cmds = (
+            f'\npre_recording_command = "{toml_quote(rec_start_cmd)}"\n'
+            f'post_output_command = "{toml_quote(rec_stop_cmd)}"'
+        )
+        updated = updated[:pos] + cmds + updated[pos:]
     write_text_atomic(config_path, updated, mode=original_mode)
     return {
         "backup": str(backup) if backup else None,
@@ -488,6 +546,11 @@ def disable_in_config(config_path: Path, previous_command: str | None, previous_
         updated = original[:start] + original[end:]
         updated = re.sub(r"\n{3,}", "\n\n", updated)
 
+    updated = re.sub(
+        r'(?m)^\s*(pre_recording_command|post_output_command)\s*=.*?' + re.escape(PLUGIN_NAME) + r'.*?\n',
+        '',
+        updated,
+    )
     write_text_atomic(config_path, updated, mode=file_mode(config_path))
     return {"wired": False}
 
@@ -657,12 +720,169 @@ def copy_text(text: str) -> None:
         raise SystemExit("wl-copy failed")
 
 
+def stop_active_recording(discard_if_empty: bool = False) -> dict | None:
+    path = active_rec_path()
+    if not path_present(path):
+        return None
+    data = read_json(path, {})
+    if not isinstance(data, dict):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    pid = data.get("pid")
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            pass
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                wpid, _ = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    break
+            except ChildProcessError:
+                break
+            time.sleep(0.02)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    audio_file = data.get("audio")
+    if discard_if_empty and audio_file:
+        try:
+            p = Path(audio_file)
+            if p.is_file() and p.stat().st_size <= 44:
+                p.unlink(missing_ok=True)
+                data["audio"] = None
+        except OSError:
+            pass
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return data
+
+
+def cmd_record_start(_args: argparse.Namespace) -> int:
+    stop_active_recording(discard_if_empty=True)
+    ensure_dirs()
+    rec_id = uuid.uuid4().hex[:12]
+    audio_path = audio_dir() / f"{rec_id}.wav"
+    rec_bin = shutil.which("pw-record") or shutil.which("parecord") or shutil.which("arecord")
+    if not rec_bin:
+        return 0
+
+    if "pw-record" in rec_bin or "parecord" in rec_bin:
+        cmd = [rec_bin, "--format=s16", "--rate=16000", "--channels=1", str(audio_path)]
+    else:
+        cmd = [rec_bin, "-f", "S16_LE", "-r", "16000", "-c", "1", str(audio_path)]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        rec_data = {
+            "id": rec_id,
+            "pid": proc.pid,
+            "audio": str(audio_path),
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        write_text_atomic(active_rec_path(), json.dumps(rec_data, indent=2) + "\n")
+    except OSError:
+        pass
+    return 0
+
+
+def cmd_record_stop(_args: argparse.Namespace) -> int:
+    rec_data = stop_active_recording(discard_if_empty=False)
+    if rec_data and rec_data.get("audio"):
+        wav = Path(rec_data["audio"])
+        if wav.is_file() and wav.stat().st_size > 1024:
+            with StoreLock():
+                entries = load_entries()
+                if not any(e["id"] == rec_data["id"] for e in entries):
+                    entries.append({
+                        "id": rec_data["id"],
+                        "ts": rec_data.get("ts") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "text": "(Interrupted - click to re-transcribe)",
+                        "pinned": False,
+                        "audio": str(wav),
+                    })
+                    meta = load_meta()
+                    dump_entries(prune_entries(entries, meta["maxEntries"]))
+    return 0
+
+
+def recover_interrupted_recordings() -> None:
+    rec_path = active_rec_path()
+    if not path_present(rec_path):
+        return
+    data = read_json(rec_path, {})
+    if not isinstance(data, dict):
+        try:
+            rec_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+
+    pid = data.get("pid")
+    is_alive = False
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            is_alive = True
+        except (ProcessLookupError, PermissionError):
+            is_alive = False
+
+    if not is_alive:
+        wav_file = data.get("audio")
+        rec_id = data.get("id") or uuid.uuid4().hex[:12]
+        if wav_file and Path(wav_file).is_file() and Path(wav_file).stat().st_size > 1024:
+            entries = load_entries()
+            if not any(e["id"] == rec_id for e in entries):
+                entries.append({
+                    "id": rec_id,
+                    "ts": data.get("ts") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "text": "(Interrupted - click to re-transcribe)",
+                    "pinned": False,
+                    "audio": wav_file,
+                })
+                meta = load_meta()
+                dump_entries(prune_entries(entries, meta["maxEntries"]))
+        try:
+            rec_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def cmd_log(_args: argparse.Namespace) -> int:
     text = clip_transcript(read_stdin_limited(MAX_TRANSCRIPT_BYTES))
     output = text
-    # Voxtype types whatever we emit; never let store failures swallow a dictation.
-    # The lock is held only around store reads/writes, never across the chain,
-    # so panel commands stay responsive while a postprocessor runs.
+    rec_data = stop_active_recording(discard_if_empty=False)
+    audio_path = None
+    ident = None
+    ts = None
+    if rec_data:
+        ident = rec_data.get("id")
+        ts = rec_data.get("ts")
+        wav = Path(rec_data.get("audio") or "")
+        if wav.is_file() and wav.stat().st_size > 44:
+            audio_path = str(wav)
+        elif wav.is_file():
+            try:
+                wav.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     try:
         with StoreLock():
             meta = load_meta()
@@ -677,7 +897,10 @@ def cmd_log(_args: argparse.Namespace) -> int:
         if not meta.get("paused") and text.strip():
             with StoreLock():
                 entries = load_entries()
-                entries.append(new_entry(output if output.strip() else text))
+                item = new_entry(output if output.strip() else text, ident=ident, audio_path=audio_path)
+                if ts:
+                    item["ts"] = ts
+                entries.append(item)
                 dump_entries(prune_entries(entries, meta["maxEntries"]))
     except Exception:
         pass
@@ -714,6 +937,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 def cmd_list(_args: argparse.Namespace) -> int:
     with StoreLock():
+        recover_interrupted_recordings()
         json.dump(load_entries(), sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
@@ -747,9 +971,11 @@ def cmd_pin(args: argparse.Namespace, pinned: bool) -> int:
 def cmd_delete(args: argparse.Namespace) -> int:
     with StoreLock():
         entries = load_entries()
-        next_entries = [entry for entry in entries if entry["id"] != args.id]
-        if len(next_entries) == len(entries):
+        target = find_entry(entries, args.id)
+        if not target:
             raise SystemExit(f"unknown id: {args.id}")
+        delete_audio_for_entry(target)
+        next_entries = [entry for entry in entries if entry["id"] != args.id]
         dump_entries(next_entries)
     return 0
 
@@ -758,9 +984,93 @@ def cmd_clear(args: argparse.Namespace) -> int:
     with StoreLock():
         entries = load_entries()
         if args.all:
+            for entry in entries:
+                delete_audio_for_entry(entry)
             dump_entries([])
         else:
-            dump_entries([entry for entry in entries if entry.get("pinned")])
+            kept = []
+            for entry in entries:
+                if entry.get("pinned"):
+                    kept.append(entry)
+                else:
+                    delete_audio_for_entry(entry)
+            dump_entries(kept)
+    return 0
+
+
+def parse_voxtype_transcribe_output(raw: str) -> str:
+    lines = []
+    capture = False
+    for line in raw.splitlines():
+        if line.startswith("VAD:"):
+            capture = True
+            continue
+        if capture:
+            stripped = line.strip()
+            if stripped:
+                lines.append(stripped)
+    if lines:
+        return " ".join(lines)
+    filtered = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if any(s.startswith(prefix) for prefix in ("Loading audio file", "Audio format", "Processing", "VAD:", "202", "INFO", "WARN", "ERROR")):
+            continue
+        filtered.append(s)
+    return " ".join(filtered).strip()
+
+
+def cmd_retranscribe(args: argparse.Namespace) -> int:
+    with StoreLock():
+        entries = load_entries()
+        entry = find_entry(entries, args.id)
+        if not entry:
+            raise SystemExit(f"unknown id: {args.id}")
+        audio = entry.get("audio") or str(audio_dir() / f"{args.id}.wav")
+        wav = Path(audio)
+        if not wav.is_file():
+            raise SystemExit(f"no audio file found for id: {args.id}")
+
+    voxtype_bin = shutil.which("voxtype") or "voxtype"
+    try:
+        proc = subprocess.run(
+            [voxtype_bin, "-q", "transcribe", str(wav)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit("transcription timed out")
+    except OSError as exc:
+        raise SystemExit(f"failed to run voxtype: {exc}")
+
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip()
+        raise SystemExit(f"transcription failed: {err}")
+
+    cleaned = parse_voxtype_transcribe_output(proc.stdout)
+    if not cleaned:
+        cleaned = "(No speech detected)"
+
+    with StoreLock():
+        entries = load_entries()
+        entry = find_entry(entries, args.id)
+        if entry:
+            entry["text"] = cleaned
+            if not entry.get("audio"):
+                entry["audio"] = str(wav)
+            dump_entries(entries)
+
+    if getattr(args, "copy", True):
+        try:
+            copy_text(cleaned)
+        except SystemExit:
+            pass
+
+    json.dump({"ok": True, "id": args.id, "text": cleaned}, sys.stdout)
+    sys.stdout.write("\n")
     return 0
 
 
@@ -845,6 +1155,17 @@ def build_parser() -> argparse.ArgumentParser:
     copy.add_argument("id")
     copy.set_defaults(handler=cmd_copy)
 
+    rec_start = sub.add_parser("record-start", help="Start background audio capture")
+    rec_start.set_defaults(handler=cmd_record_start)
+
+    rec_stop = sub.add_parser("record-stop", help="Stop background audio capture")
+    rec_stop.set_defaults(handler=cmd_record_stop)
+
+    retranscribe = sub.add_parser("retranscribe", help="Re-transcribe audio for an entry")
+    retranscribe.add_argument("id")
+    retranscribe.add_argument("--no-copy", dest="copy", action="store_false", help="Do not copy retranscribed text to clipboard")
+    retranscribe.set_defaults(handler=cmd_retranscribe)
+
     sub.add_parser("enable", help="Wire ~/.config/voxtype/config.toml to this hook")
     sub.add_parser("disable", help="Remove this hook from Voxtype config")
     return parser
@@ -864,6 +1185,9 @@ def main(argv: list[str] | None = None) -> int:
         "pause": cmd_pause,
         "enable": cmd_enable,
         "disable": cmd_disable,
+        "record-start": cmd_record_start,
+        "record-stop": cmd_record_stop,
+        "retranscribe": cmd_retranscribe,
     }
     if hasattr(args, "handler"):
         return args.handler(args)

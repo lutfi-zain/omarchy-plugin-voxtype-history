@@ -324,6 +324,57 @@ class EnableConfigModeTests(unittest.TestCase):
         finally:
             os.umask(old)
 
+class AudioFileLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.tmp.name) / "voxtype-history"
+        self.audio_dir = self.data_dir / "audio"
+        os.environ["XDG_DATA_HOME"] = self.tmp.name
+        os.environ["XDG_RUNTIME_DIR"] = self.tmp.name
+        MOD.ensure_dirs()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_normalize_entry_preserves_audio(self):
+        entry = MOD.normalize_entry({"id": "123", "ts": "2026-08-25T10:00:00Z", "text": "hello", "audio": "/tmp/123.wav"})
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.get("audio"), "/tmp/123.wav")
+
+    def test_delete_removes_associated_wav_file(self):
+        wav_file = self.audio_dir / "abc.wav"
+        wav_file.write_bytes(b"RIFFdummydata")
+        self.assertTrue(wav_file.is_file())
+
+        entries = [
+            {"id": "abc", "ts": "2026-08-25T10:00:00Z", "text": "to delete", "pinned": False, "audio": str(wav_file)},
+            {"id": "keep", "ts": "2026-08-25T10:05:00Z", "text": "to keep", "pinned": False},
+        ]
+        MOD.dump_entries(entries)
+        MOD.cmd_delete(type("Args", (), {"id": "abc"})())
+        self.assertFalse(wav_file.exists())
+        remaining = MOD.load_entries()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], "keep")
+
+    def test_clear_removes_unpinned_wav_files(self):
+        wav_unpinned = self.audio_dir / "unpinned.wav"
+        wav_unpinned.write_bytes(b"unpinned")
+        wav_pinned = self.audio_dir / "pinned.wav"
+        wav_pinned.write_bytes(b"pinned")
+
+        entries = [
+            {"id": "u1", "ts": "2026-08-25T10:00:00Z", "text": "unpinned text", "pinned": False, "audio": str(wav_unpinned)},
+            {"id": "p1", "ts": "2026-08-25T10:01:00Z", "text": "pinned text", "pinned": True, "audio": str(wav_pinned)},
+        ]
+        MOD.dump_entries(entries)
+        MOD.cmd_clear(type("Args", (), {"all": False})())
+        self.assertFalse(wav_unpinned.exists())
+        self.assertTrue(wav_pinned.exists())
+        remaining = MOD.load_entries()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["id"], "p1")
+
 
 if __name__ == "__main__":
     unittest.main()

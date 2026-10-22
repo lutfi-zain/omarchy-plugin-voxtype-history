@@ -38,11 +38,11 @@ Hold F9 or toggle Super+Ctrl+X to dictate as usual. Each finished transcript app
 | --- | --- |
 | Open | Click the bar icon |
 | Copy | Click a row, or `c` |
+| Re-transcribe | `r` or the re-transcribe button (re-runs transcription on saved WAV) |
 | Pin | `p` or the pin button (pinned rows survive prune and Clear) |
-| Delete | `x` or the delete button |
+| Delete | `x` or the delete button (also deletes the WAV audio file) |
 | Search | `/` |
 | Pause logging | Right-click the bar icon, or the header switch |
-
 The bar icon tints while Voxtype is recording or transcribing.
 
 ## Files
@@ -50,9 +50,9 @@ The bar icon tints while Voxtype is recording or transcribing.
 | Path | Role |
 | --- | --- |
 | `~/.local/share/voxtype-history/history.jsonl` | One JSON object per dictation |
+| `~/.local/share/voxtype-history/audio/` | Saved 16kHz WAV recordings per dictation |
 | `~/.local/share/voxtype-history/meta.json` | Pause flag and previous post-process command |
-| `~/.config/voxtype/config.toml` | Voxtype config; Enable capture writes `[output.post_process]` |
-
+| `~/.config/voxtype/config.toml` | Voxtype config; Enable capture writes output hooks |
 Unpinned history is pruned to 500 entries. Disable capture from a terminal if you want Voxtype to stop calling the hook:
 
 ```sh
