@@ -150,6 +150,7 @@ Panel {
           if (root.selectedEntry)
             root.callHost("retranscribeEntry", root.selectedEntry.id)
         }
+      }
 
       Column {
         id: content
