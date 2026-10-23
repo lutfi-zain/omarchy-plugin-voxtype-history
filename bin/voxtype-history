@@ -797,6 +797,17 @@ def cmd_record_start(_args: argparse.Namespace) -> int:
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         write_text_atomic(active_rec_path(), json.dumps(rec_data, indent=2) + "\n")
+        with StoreLock():
+            entries = load_entries()
+            entries.append({
+                "id": rec_id,
+                "ts": rec_data["ts"],
+                "text": "(Recording in progress...)",
+                "pinned": False,
+                "audio": str(audio_path),
+            })
+            meta = load_meta()
+            dump_entries(prune_entries(entries, meta["maxEntries"]))
     except OSError:
         pass
     return 0
@@ -824,44 +835,32 @@ def cmd_record_stop(_args: argparse.Namespace) -> int:
 
 def recover_interrupted_recordings() -> None:
     rec_path = active_rec_path()
-    if not path_present(rec_path):
-        return
-    data = read_json(rec_path, {})
-    if not isinstance(data, dict):
-        try:
-            rec_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return
-
-    pid = data.get("pid")
-    is_alive = False
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-            is_alive = True
-        except (ProcessLookupError, PermissionError):
+    if path_present(rec_path):
+        data = read_json(rec_path, {})
+        if isinstance(data, dict):
+            pid = data.get("pid")
             is_alive = False
+            if isinstance(pid, int) and pid > 0:
+                try:
+                    os.kill(pid, 0)
+                    is_alive = True
+                except (ProcessLookupError, PermissionError):
+                    is_alive = False
+            if not is_alive:
+                try:
+                    rec_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
-    if not is_alive:
-        wav_file = data.get("audio")
-        rec_id = data.get("id") or uuid.uuid4().hex[:12]
-        if wav_file and Path(wav_file).is_file() and Path(wav_file).stat().st_size > 1024:
-            entries = load_entries()
-            if not any(e["id"] == rec_id for e in entries):
-                entries.append({
-                    "id": rec_id,
-                    "ts": data.get("ts") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "text": "(Interrupted - click to re-transcribe)",
-                    "pinned": False,
-                    "audio": wav_file,
-                })
-                meta = load_meta()
-                dump_entries(prune_entries(entries, meta["maxEntries"]))
-        try:
-            rec_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    entries = load_entries()
+    modified = False
+    for entry in entries:
+        if "(Recording in progress" in entry.get("text", ""):
+            entry["text"] = "(Transcription failed - click to re-transcribe)"
+            modified = True
+    if modified:
+        meta = load_meta()
+        dump_entries(prune_entries(entries, meta["maxEntries"]))
 
 
 def cmd_log(_args: argparse.Namespace) -> int:
@@ -894,14 +893,25 @@ def cmd_log(_args: argparse.Namespace) -> int:
         timeout = min(MAX_CHAIN_TIMEOUT_MS, max(1, timeout))
         if chain:
             output = run_chain(str(chain), text, timeout)
-        if not meta.get("paused") and text.strip():
-            with StoreLock():
-                entries = load_entries()
-                item = new_entry(output if output.strip() else text, ident=ident, audio_path=audio_path)
-                if ts:
-                    item["ts"] = ts
-                entries.append(item)
+        with StoreLock():
+            entries = load_entries()
+            existing = find_entry(entries, ident) if ident else None
+            if text.strip():
+                if existing:
+                    existing["text"] = output if output.strip() else text
+                    if audio_path:
+                        existing["audio"] = audio_path
+                elif not meta.get("paused"):
+                    item = new_entry(output if output.strip() else text, ident=ident, audio_path=audio_path)
+                    if ts:
+                        item["ts"] = ts
+                    entries.append(item)
                 dump_entries(prune_entries(entries, meta["maxEntries"]))
+            elif existing:
+                # Silence / no speech detected: drop placeholder and clean empty audio
+                delete_audio_for_entry(existing)
+                entries = [e for e in entries if e["id"] != ident]
+                dump_entries(entries)
     except Exception:
         pass
     sys.stdout.write(output)
@@ -1120,6 +1130,13 @@ def cmd_disable(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_recover(_args: argparse.Namespace) -> int:
+    with StoreLock():
+        recover_interrupted_recordings()
+        entries = load_entries()
+    json.dump({"ok": True, "count": len(entries)}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="voxtype-history", description=__doc__)
     sub = parser.add_subparsers(dest="command")
@@ -1166,6 +1183,9 @@ def build_parser() -> argparse.ArgumentParser:
     retranscribe.add_argument("--no-copy", dest="copy", action="store_false", help="Do not copy retranscribed text to clipboard")
     retranscribe.set_defaults(handler=cmd_retranscribe)
 
+    recover = sub.add_parser("recover", help="Recover interrupted or failed recordings")
+    recover.set_defaults(handler=cmd_recover)
+
     sub.add_parser("enable", help="Wire ~/.config/voxtype/config.toml to this hook")
     sub.add_parser("disable", help="Remove this hook from Voxtype config")
     return parser
@@ -1188,6 +1208,7 @@ def main(argv: list[str] | None = None) -> int:
         "record-start": cmd_record_start,
         "record-stop": cmd_record_stop,
         "retranscribe": cmd_retranscribe,
+        "recover": cmd_recover,
     }
     if hasattr(args, "handler"):
         return args.handler(args)

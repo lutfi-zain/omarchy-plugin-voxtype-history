@@ -85,9 +85,15 @@ BarWidget {
     if ("hostWidget" in target) target.hostWidget = root
   }
 
-  function open() { if (panelLoader.item) panelLoader.item.open() }
+  function open() {
+    runCli(["recover"])
+    if (panelLoader.item) panelLoader.item.open()
+  }
   function close() { if (panelLoader.item) panelLoader.item.close() }
-  function togglePanel() { if (panelLoader.item) panelLoader.item.toggle() }
+  function togglePanel() {
+    if (opened) close()
+    else open()
+  }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
   implicitWidth: button.implicitWidth
